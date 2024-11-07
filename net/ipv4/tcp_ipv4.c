@@ -372,13 +372,14 @@ int tcp_v4_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)
     inet->inet_id = prandom_u32();
 
     // 如果启用了 TCP Fast Open(一种优化的 TCP 连接建立方法,允许客户端在发送 SYN 时直接携带数据)，则延迟连接，直到发送 SYN 包
-	// 内容于传统三次握手有所不同，感兴趣的可以自行去搜集资料学习
+	// 会在后面发送SYN包的时候直接附带上数据(tcp_connect函数中)
     if (tcp_fastopen_defer_connect(sk, &err))
         return err;
     if (err)
         goto failure;
 
     // 发起实际的连接
+	// 会在里面调用 tcp_send_syn_data 构建并发送SYN包、使用tcp_transmit_skb 传输TCP数据包
     err = tcp_connect(sk);
 
     // 如果连接失败，跳转到失败处理

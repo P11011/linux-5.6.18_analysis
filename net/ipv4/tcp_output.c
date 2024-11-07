@@ -3637,48 +3637,81 @@ int tcp_connect(struct sock *sk)
 	struct sk_buff *buff;
 	int err;
 
+	// 调用了 tcp_call_bpf 函数，目的是触发一个与 TCP 连接建立过程相关的 eBPF (BPF) 回调操作
+	// 这里它触发一个 TCP 连接的 BPF 回调 BPF_SOCK_OPS_TCP_CONNECT_CB(一个与套接字操作相关的 cgroup BPF 程序)，通常用于网络监控或者流量控制
+	// BPF:一个通用的框架，能够在 Linux 内核中执行用户定义的代码。
 	tcp_call_bpf(sk, BPF_SOCK_OPS_TCP_CONNECT_CB, 0, NULL);
 
+	// 试根据当前路由信息来重建 IP 数据包的头部。
+	// 如果该函数返回错误，表示路由不可达或其他网络问题，函数会返回 -EHOSTUNREACH
 	if (inet_csk(sk)->icsk_af_ops->rebuild_header(sk))
 		return -EHOSTUNREACH; /* Routing failure or similar. */
 
+	// 这个函数用于初始化与连接相关的各种 TCP 参数和状态。
+	// 它会配置 TCP 状态机和一些必要的字段（例如初始序列号等）。
 	tcp_connect_init(sk);
 
+	// tp->repair 表示当前连接是否处于“修复模式”。如果是修复模式，
+	// 则调用 tcp_finish_connect 完成连接，并直接返回。 
+	// 修复模式：一个特定的连接状态，通常用于于测试、调试、恢复或特殊操作
 	if (unlikely(tp->repair)) {
 		tcp_finish_connect(sk, NULL);
 		return 0;
 	}
 
+	// sk_stream_alloc_skb 用于为发送数据分配一个 sk_buff（socket buffer）。
+	// 该缓冲区会用于存放待发送的数据包。
+	// 如果分配失败，则返回 -ENOBUFS，表示内存不足
 	buff = sk_stream_alloc_skb(sk, 0, sk->sk_allocation, true);
 	if (unlikely(!buff))
 		return -ENOBUFS;
 
+	// tcp_init_nondata_skb 函数初始化一个不含数据的 TCP 数据包，这里是用于发送一个 SYN 包。
+	// tp->write_seq++ 设置数据包的序列号并递增。
 	tcp_init_nondata_skb(buff, tp->write_seq++, TCPHDR_SYN);
+	// tcp_mstamp_refresh 刷新时间戳
 	tcp_mstamp_refresh(tp);
+	// tcp_time_stamp 获取当前时间戳并存储在 retrans_stamp 中，用于后续的重传判断。
 	tp->retrans_stamp = tcp_time_stamp(tp);
+
 	tcp_connect_queue_skb(sk, buff);
+	// tcp_ecn_send_syn 用于处理显式拥塞通知（ECN），这是 TCP 协议中的一种流量控制机制。
+	// ECN（Explicit Congestion Notification）：用于在网络出现拥塞时，以更加高效的方式通知传输端，避免因丢包引发的性能损失。
+	// ECN 允许网络中的路由器在发生拥塞时标记数据包，而不是丢弃数据包，从而减少了由于丢包而导致的重传和延迟。
+	// 其目的是让端系统（发送端和接收端）能够及时察觉拥塞，并采取措施调整传输速率，避免进一步的拥塞
 	tcp_ecn_send_syn(sk, buff);
+	// 将 SYN 包添加到 TCP 重传队列（tcp_rtx_queue）中，以便在必要时重传。
 	tcp_rbtree_insert(&sk->tcp_rtx_queue, buff);
 
-	/* Send off SYN; include data in Fast Open. */
+	// 如果是快速打开连接（TCP Fast Open 即TFO），则调用 tcp_send_syn_data 发送带数据的 SYN 包（对应tcp_v4_connect中的TFO延迟连接，直到发送 SYN 包）。
+	// 否则，调用 tcp_transmit_skb 发送纯 SYN 包。
+	// tcp_transmit_skb 是 TCP 发送数据的核心函数。
 	err = tp->fastopen_req ? tcp_send_syn_data(sk, buff) :
 	      tcp_transmit_skb(sk, buff, 1, sk->sk_allocation);
 	if (err == -ECONNREFUSED)
 		return err;
 
-	/* We change tp->snd_nxt after the tcp_transmit_skb() call
-	 * in order to make this packet get counted in tcpOutSegs.
-	 */
+	// WRITE_ONCE 是一个保证写入操作只执行一次的宏，
+	// 确保更新发送序列号 snd_nxt，并且设置 pushed_seq 为当前的写序列号。
 	WRITE_ONCE(tp->snd_nxt, tp->write_seq);
 	tp->pushed_seq = tp->write_seq;
+	// tcp_send_head() 函数用于返回当前 TCP 连接的待发送报文段（sk_buff）。
+	// sk_buff 是 Linux 内核中用来表示一个网络数据包的结构。
+	// 该函数的具体功能是获取当前 TCP 连接中最前面的待发送数据包，也就是下一个要发送的数据包
 	buff = tcp_send_head(sk);
+	// 是一个条件宏，表示我们期望 buff 很少为 NULL（即我们期望大多数情况下都有待发送的报文段）。
+	// 这个宏是基于编译器的优化，告诉编译器这个分支的条件不太可能成立，从而优化 CPU 缓存的使用，提高代码效率。
 	if (unlikely(buff)) {
+		// 更新 TCP 连接的发送序列号 snd_nxt 为当前待发送报文段的序列号。
 		WRITE_ONCE(tp->snd_nxt, TCP_SKB_CB(buff)->seq);
+		//将当前待发送报文段的序列号赋给 pushed_seq，表示已经“推进”到这个序列号的报文段。
 		tp->pushed_seq	= TCP_SKB_CB(buff)->seq;
 	}
+	// 更新 TCP 连接统计信息，增加 ACTIVEOPENS 计数，表示一个新的连接请求。
 	TCP_INC_STATS(sock_net(sk), TCP_MIB_ACTIVEOPENS);
 
-	/* Timer for repeating the SYN until an answer. */
+	// 设置一个重传定时器，icsk_rto 是当前重传超时（RTO）值。
+	// 如果发送的 SYN 包未得到响应，则在超时后进行重传。
 	inet_csk_reset_xmit_timer(sk, ICSK_TIME_RETRANS,
 				  inet_csk(sk)->icsk_rto, TCP_RTO_MAX);
 	return 0;
