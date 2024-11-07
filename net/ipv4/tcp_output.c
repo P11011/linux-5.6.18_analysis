@@ -1075,6 +1075,14 @@ static void tcp_update_skb_after_send(struct sock *sk, struct sk_buff *skb,
  * We are working here with either a clone of the original
  * SKB, or a fresh unique copy made by the retransmit engine.
  */
+ // 负责传输 TCP 数据包。它会处理每个待发送的 TCP 数据包，构建 TCP 头部、填充选项，并最终将其传输到底层网络堆栈。
+ // 这个函数不仅用于初始的 TCP 数据包发送，还包括重传机制。
+ // 参数介绍：
+ // *sk：执向当前 TCP 套接字。
+ // *skb：指向待发送的数据包（sk_buff），它不包含 TCP 头部，需要在此函数中构建。
+ // clone_it：如果为 1，表示需要克隆原始的 skb，如果为 0，则直接使用现有的 skb。
+ // gfp_mask：用于分配内存时的标志。
+ // rcv_nxt：接收方期望的下一个序列号（用于 ACK）
 static int __tcp_transmit_skb(struct sock *sk, struct sk_buff *skb,
 			      int clone_it, gfp_t gfp_mask, u32 rcv_nxt)
 {
@@ -1090,16 +1098,23 @@ static int __tcp_transmit_skb(struct sock *sk, struct sk_buff *skb,
 	u64 prior_wstamp;
 	int err;
 
+	// 确保传入的 skb 非空，并且 skb 中确实有数据包。tcp_skb_pcount(skb) 返回 skb 中包含的数据包数量。
 	BUG_ON(!skb || !tcp_skb_pcount(skb));
 	tp = tcp_sk(sk);
+	// 用于记录之前更新的时间戳，后面有用
 	prior_wstamp = tp->tcp_wstamp_ns;
+	// tp->tcp_wstamp_ns用于存储当前 TCP 套接字的 "写时间戳"（即发送数据包时的时间戳）,在每次发送数据包时更新，以便记录最后一次发送包的时间。
+	// tcp_clock_cache 是用来缓存 TCP 时钟的值，防止频繁地从硬件获取时间。
+	// 使用max() 函数的来更新时间戳,保证其是最新的
 	tp->tcp_wstamp_ns = max(tp->tcp_wstamp_ns, tp->tcp_clock_cache);
+	// 将时间戳存储在 skb 中，以便后续使用。
 	skb->skb_mstamp_ns = tp->tcp_wstamp_ns;
+	// 如果 clone_it 为 1，则对 skb 进行克隆或复制。
 	if (clone_it) {
 		TCP_SKB_CB(skb)->tx.in_flight = TCP_SKB_CB(skb)->end_seq
 			- tp->snd_una;
 		oskb = skb;
-
+		// skb_clone() 和 pskb_copy() 都是用于复制 skb 的函数，具体选择哪个取决于是否是已克隆的 skb。
 		tcp_skb_tsorted_save(oskb) {
 			if (unlikely(skb_cloned(oskb)))
 				skb = pskb_copy(oskb, gfp_mask);
@@ -1109,62 +1124,84 @@ static int __tcp_transmit_skb(struct sock *sk, struct sk_buff *skb,
 
 		if (unlikely(!skb))
 			return -ENOBUFS;
-		/* retransmit skbs might have a non zero value in skb->dev
-		 * because skb->dev is aliased with skb->rbnode.rb_left
-		 */
+
+		// 重传的 skb 可能会有非零的 skb->dev 字段，这个字段会影响克隆，所以我们清空它。
 		skb->dev = NULL;
 	}
-
+	// inet_sk(sk) 获取的是套接字 sk 的 inet_sock 结构体（即 IPv4 相关的套接字信息）。这个结构体包含了与 IP 协议族相关的字段，比如源地址、目标地址等
 	inet = inet_sk(sk);
+	// TCP_SKB_CB(skb) 返回一个指向 struct tcp_skb_cb 结构体的指针，该结构体包含与该 sk_buff（数据包）相关的 TCP 特定信息。
+	// tcb 就是用来访问该数据包的 TCP 控制块信息，例如 TCP 序列号、标志位等。
 	tcb = TCP_SKB_CB(skb);
+	// opts 是一个结构体，用来存储 TCP 选项的相关信息。在处理每个数据包时，要将这个结构体清零，以确保后续操作不会受到之前数据的影响
 	memset(&opts, 0, sizeof(opts));
 
+	// 检查数据包是否是 SYN 包。TCPHDR_SYN 是一个 TCP 标志，表示该数据包是一个 SYN 包，用于连接建立的过程。
+	// tcb->tcp_flags & TCPHDR_SYN 会返回一个布尔值，判断是否包含 SYN 标志
 	if (unlikely(tcb->tcp_flags & TCPHDR_SYN)) {
+		// 如果是 SYN 包，调用 tcp_syn_options 来处理 SYN 包的选项，并计算 TCP 选项的大小。。
+		// tcp_syn_options 函数将会根据当前套接字 sk 和其他信息，填充 opts 结构体，并返回这些选项的总大小。返回值将存储在 tcp_options_size 中。
+		// md5 是一个指针，用于保存 MD5 签名的相关数据（如果启用了 TCP MD5 签名）
 		tcp_options_size = tcp_syn_options(sk, skb, &opts, &md5);
 	} else {
+		// 如果不是 SYN 包，则调用 tcp_established_options 处理已建立连接后的 TCP 选项（例如窗口大小、窗口扩大因子等）。
+		// tcp_established_options 函数会为连接建立后的数据包计算选项并填充 opts 结构体
 		tcp_options_size = tcp_established_options(sk, skb, &opts,
 							   &md5);
-		/* Force a PSH flag on all (GSO) packets to expedite GRO flush
-		 * at receiver : This slightly improve GRO performance.
-		 * Note that we do not force the PSH flag for non GSO packets,
-		 * because they might be sent under high congestion events,
-		 * and in this case it is better to delay the delivery of 1-MSS
-		 * packets and thus the corresponding ACK packet that would
-		 * release the following packet.
-		 */
+
+		// 这个条件判断检查数据包是否包含多个片段。tcp_skb_pcount(skb) 返回当前 sk_buff 中的片段数。
 		if (tcp_skb_pcount(skb) > 1)
+			// 如果数据包包含多个片段（即 tcp_skb_pcount(skb) > 1），就强制设置 TCPHDR_PSH 标志。PSH 标志表示请求接收方尽早将数据推送到应用层，而不是等待缓冲区填满。
+			// PSH 标志有助于提高接收端的聚合性能，因为接收端可以更早地将数据交给应用层，而不是等待更多的数据。
 			tcb->tcp_flags |= TCPHDR_PSH;
 	}
+	// tcp_header_size 是数据包的总 TCP 头部大小，包括 TCP 标准头部、和所有的选项。
+	// sizeof(struct tcphdr) 是标准 TCP 头部的大小（通常为 20 字节），这是 TCP 协议头部的固定部分。
+	// tcp_options_size 是根据当前的 TCP 选项（如 MSS、时间戳等）计算出来的可变大小
 	tcp_header_size = tcp_options_size + sizeof(struct tcphdr);
 
-	/* if no packet is in qdisc/device queue, then allow XPS to select
-	 * another queue. We can be called from tcp_tsq_handler()
-	 * which holds one reference to sk.
-	 *
-	 * TODO: Ideally, in-flight pure ACK packets should not matter here.
-	 * One way to get this would be to set skb->truesize = 2 on them.
-	 */
+	// skb->ooo_okay：这个字段是 sk_buff 结构中的一个标志，用来指示是否可以接受 “乱序” 的数据包。
+	// 可以告诉 TCP 是否可以接受乱序的包，通常是为了启用零拷贝和加速接收缓冲区的处理。
+	// sk_wmem_alloc_get(sk)：这个函数返回当前套接字的发送缓冲区的剩余空间，即写缓冲区的当前剩余空间（以字节为单位）
+	// SKB_TRUESIZE(1)：这是一个宏，用于计算 sk_buff 的实际内存占用（包括所有的附加数据和头部）。SKB_TRUESIZE(1) 返回一个表示单个数据包大小的内存值。
 	skb->ooo_okay = sk_wmem_alloc_get(sk) < SKB_TRUESIZE(1);
 
-	/* If we had to use memory reserve to allocate this skb,
-	 * this might cause drops if packet is looped back :
-	 * Other socket might not have SOCK_MEMALLOC.
-	 * Packets not looped back do not care about pfmemalloc.
-	 */
+	// skb->pfmemalloc：这是 sk_buff 结构中的一个标志，表示此数据包是否是通过 SOCK_MEMALLOC 分配的。
+	// 将这个标志清零，表示当前数据包不使用 SOCK_MEMALLOC 分配的内存空间
 	skb->pfmemalloc = 0;
 
+	// 该函数将 skb 的数据区域向前推移 tcp_header_size 字节。这个操作相当于为 TCP 数据包腾出空间，准备存放 TCP 头部信息。
 	skb_push(skb, tcp_header_size);
+	// 此函数重置 skb 的传输层头部指针。即将 skb->transport_header 设置为当前数据位置，通常在设置 TCP/IP 头部时调用，以确保后续的 TCP/IP 头部正确设置。
 	skb_reset_transport_header(skb);
 
+	// 此函数将 skb 标记为 "孤立"（orphan）。
+	// 具体来说，skb_orphan 会将 skb->sk 设置为 NULL，并防止内存回收等操作。
+	// 通常是在从 TCP 发送队列或回收队列中删除数据包时调用，以避免内存资源被过早释放。
 	skb_orphan(skb);
+	// sk_buff 结构中的一个字段，指向与当前数据包关联的套接字
 	skb->sk = sk;
+	//s kb->destructor：这是 sk_buff 结构中的一个函数指针，用来在数据包不再使用时调用清理操作。它指定了一个清理函数，负责释放该数据包占用的资源。
+	// skb_is_tcp_pure_ack(skb)：这是一个检查当前数据包是否是一个纯 ACK 数据包的函数。如果是纯 ACK 包，则不需要发送数据，只需要确认连接的状态。
+	// __sock_wfree：如果是纯 ACK 包，则指定 __sock_wfree 作为清理函数。
+	// tcp_wfree：如果不是纯 ACK 包，则指定 tcp_wfree 作为清理函数。tcp_wfree 用于清理非 ACK 数据包占用的资源。
 	skb->destructor = skb_is_tcp_pure_ack(skb) ? __sock_wfree : tcp_wfree;
+	// 此函数设置 skb 的哈希值（skb->hash）以便后续路由、负载均衡等操作使用。哈希值通常基于源/目的地址、端口等信息计算，用于确定数据包的传输路径。
 	skb_set_hash_from_sk(skb, sk);
+	// 此处用来增加套接字发送缓冲区的内存分配大小。
+	// skb->truesize 是当前数据包占用的内存大小（包括头部、数据等），
+	// 而 sk->sk_wmem_alloc 是套接字的内存分配统计字段，表示套接字当前已分配的内存，通过增加该值，记录当前 skb 数据包对发送缓冲区的内存占用。
 	refcount_add(skb->truesize, &sk->sk_wmem_alloc);
 
+	// 这行代码将当前套接字的目标确认标志（sk_dst_pending_confirm）设置到 skb 中。目标确认标志表示在数据包传输时是否需要确认目标地址。
+	// 用于处理路由和目标地址缓存的确认机制，确保目标地址的正确性
 	skb_set_dst_pending_confirm(skb, sk->sk_dst_pending_confirm);
 
-	/* Build TCP header and checksum it. */
+	// 构建TCP头部
+	// th：指向 TCP 头部。
+	// th->seq 和 th->ack_seq：设置 TCP 的序列号和确认号。
+	// th->check：此处将校验和字段清零，稍后会根据数据计算校验和。
+	// th->urg_ptr：紧急指针，只有在使用紧急数据时才会非零。
 	th = (struct tcphdr *)skb->data;
 	th->source		= inet->inet_sport;
 	th->dest		= inet->inet_dport;
@@ -1176,73 +1213,126 @@ static int __tcp_transmit_skb(struct sock *sk, struct sk_buff *skb,
 	th->check		= 0;
 	th->urg_ptr		= 0;
 
-	/* The urg_mode check is necessary during a below snd_una win probe */
+	// tcp_urg_mode(tp)：这是一个检查TCP连接是否处于紧急模式（Urgent Mode）的方法。紧急模式指示TCP协议栈需要处理紧急数据（URG位设置为1），这些数据会优先处理。
+	// before(tcb->seq, tp->snd_up)：before 是一个宏，用于判断给定的序列号 tcb->seq 是否小于 snd_up。snd_up 是 TCP 中一个特殊的 "urgent pointer" 序列号，表示发送的紧急数据的结束位置。
+	// unlikely：这表示这个条件块不太可能发生，编译器会根据这个假设优化代码生成。
 	if (unlikely(tcp_urg_mode(tp) && before(tcb->seq, tp->snd_up))) {
+		// before(tp->snd_up, tcb->seq + 0x10000)：如果 snd_up 小于 tcb->seq + 0x10000，
+		// 意味着紧急数据没有超过一个 TCP 滑动窗口的大小。即当前的序列号不会太远超过 snd_up，紧急指针可以有效地设置。
 		if (before(tp->snd_up, tcb->seq + 0x10000)) {
+			// 将紧急指针 (urg_ptr) 设置为 snd_up - seq，并将其转换为网络字节序 (htons)。
 			th->urg_ptr = htons(tp->snd_up - tcb->seq);
+			// 设置 TCP 头部中的 URG 标志为 1，表示这个数据包包含紧急数据。
 			th->urg = 1;
+		// after 判断条件表示数据包的序列号加上一个较大的值（0xFFFF）是否大于 snd_nxt，
+		// 即检查当前数据包是否已超出窗口范围。如果超出了窗口范围，则设置紧急指针为最大值。
 		} else if (after(tcb->seq + 0xFFFF, tp->snd_nxt)) {
+			// 此时设置紧急指针为最大值 0xFFFF，表示数据包包含的紧急数据超出了当前滑动窗口的最大范围。
 			th->urg_ptr = htons(0xFFFF);
+			// // 设置 TCP 头部中的 URG 标志为 1，表示这个数据包包含紧急数据。
 			th->urg = 1;
 		}
 	}
 
+	// 将 TCP 选项写入到 TCP 头部。th + 1 是指向 TCP 头部之后的位置，它将指向 TCP 选项区域。
+	// tcp_options_write 会将选项写入到这个位置。opts 是一个结构体，包含了TCP选项的详细信息，
 	tcp_options_write((__be32 *)(th + 1), tp, &opts);
+	// skb_shinfo(skb)：这是访问 skb 的共享信息区域的宏。共享信息区域存储了与 skb 相关的附加信息，如 GSO（大段分段）信息。
+	// gso_type：这是一个 GSO 类型字段，标志着当前 skb 是否使用了大段分段。它指定了网络栈如何处理分段。
+	// sk->sk_gso_type：获取套接字的 GSO 类型，并将其分配给 skb，确保 skb 的 GSO 处理与套接字一致。
 	skb_shinfo(skb)->gso_type = sk->sk_gso_type;
+	// likely：此宏告诉编译器该条件更有可能为 true，可以优化代码生成。
+	// !(tcb->tcp_flags & TCPHDR_SYN)：此条件检查 TCP 数据包是否为 SYN 包。
+	// 如果 tcb->tcp_flags & TCPHDR_SYN 为真，则表示这是一个 SYN 包，反之则表示这不是 SYN 包。
 	if (likely(!(tcb->tcp_flags & TCPHDR_SYN))) {
+		// tcp_select_window(sk)：此函数计算并返回当前连接的窗口大小（即 TCP 发送缓冲区的剩余空间）。
+		// htons：将返回的窗口大小转换为网络字节序。
+	    // th->window：设置 TCP 头部中的窗口大小字段。
+		// 如果这不是一个SYN包则设置TCP头部窗口大小为当前连接的窗口大小
 		th->window      = htons(tcp_select_window(sk));
+		// tcp_ecn_send(sk, skb, th, tcp_header_size);：这是一个处理 TCP ECN（显式拥塞通知）功能的函数。
+		// 如果启用了 ECN，函数会设置相应的 ECN 标志，并更新 TCP 头部中的相应字段。
 		tcp_ecn_send(sk, skb, th, tcp_header_size);
 	} else {
-		/* RFC1323: The window in SYN & SYN/ACK segments
-		 * is never scaled.
-		 */
+		// 对于 SYN 包或 SYN/ACK 包，窗口大小不会根据发送方的可用空间进行缩放，
+		// 而是固定为接收方的窗口（rcv_wnd），并且最大为 65535（16 位字段的最大值）。
 		th->window	= htons(min(tp->rcv_wnd, 65535U));
 	}
+// 这部分代码是与 MD5 校验相关的，通过定义CONFIG_TCP_MD5SIG可以选择是否进行MD5校验，只有定义了CONFIG_TCP_MD5SIG才会执行以下检查。
+// TCP连接可以使用 MD5 签名来验证数据包的完整性。MD5 校验用于确保数据在传输过程中没有被篡改。
 #ifdef CONFIG_TCP_MD5SIG
-	/* Calculate the MD5 hash, as we have all we need now */
+	// 如果 MD5 校验已启用且连接配置了 MD5 校验，则进行 MD5 计算。
 	if (md5) {
+		// 这是一个函数调用，作用是修改套接字 sk 的某些特性。NETIF_F_GSO_MASK 是一个与 GSO（大段分段）相关的标志。此行代码的目的是确保套接字不会因为 GSO 类型而受到影响。
 		sk_nocaps_add(sk, NETIF_F_GSO_MASK);
+		// pts.hash_location 是 MD5 校验和计算需要的地址，通常会指定某个特定位置来存储哈希值。md5 是用于签名的密钥，sk 是当前的套接字，skb 是当前的发送缓冲区（即数据包）。
+		// 这一行代码实际上调用了用于计算 MD5 校验和的函数。tp->af_specific 是指向与地址族相关的特定操作函数指针结构，
+		// calc_md5_hash 是一个虚拟函数，它根据 TCP 连接的配置（如 MD5 密钥）计算数据包的 MD5 哈希。
 		tp->af_specific->calc_md5_hash(opts.hash_location,
 					       md5, sk, skb);
 	}
 #endif
 
+	// 确保发送的数据包满足特定地址族的要求
 	icsk->icsk_af_ops->send_check(sk, skb);
 
+	// 如果当前的 TCP 数据包是一个确认（ACK）包
 	if (likely(tcb->tcp_flags & TCPHDR_ACK))
+		// 这行代码处理 ACK 数据包发送后的事件。tcp_event_ack_sent 会记录发送 ACK 包后的一些统计信息。
+		// tcp_skb_pcount(skb) 返回该 skb（数据包）中的段数，这对于多段 TCP 包是有用的。
+		// rcv_nxt 是接收方期望接收的下一个序列号
 		tcp_event_ack_sent(sk, tcp_skb_pcount(skb), rcv_nxt);
-
+	// 判断当前的 skb 数据包的长度是否大于 TCP 头部的长度。如果是，说明这个数据包包含了有效的 TCP 数据。
 	if (skb->len != tcp_header_size) {
+		// 如果包含有效数据
+		// 使用tcp_event_data_sent 处理发送数据包后的事件，记录数据包发送的统计信息
 		tcp_event_data_sent(tp, sk);
+		// 更新 TCP 连接发送的段数统计。
+		// tcp_skb_pcount(skb) 返回当前数据包中包含的 TCP 段数（通常是 1，除非启用了 GSO）。
 		tp->data_segs_out += tcp_skb_pcount(skb);
+		// 更新已发送的字节数。
+		// skb->len 是数据包的总长度，而 tcp_header_size 是 TCP 头部的大小，因此 skb->len - tcp_header_size 是数据包中有效数据的大小
 		tp->bytes_sent += skb->len - tcp_header_size;
 	}
 
+	// after 是一个宏，用来判断一个序列号是否大于另一个。
+	// 这里的意思是，如果当前数据包的结束序列号 tcb->end_seq 大于发送窗口中的下一个序列号 tp->snd_nxt，或者当前数据包的序列号与结束序列号相等，则进行以下统计更新：
 	if (after(tcb->end_seq, tp->snd_nxt) || tcb->seq == tcb->end_seq)
+		// 这行代码将发送的数据包段数添加到 TCP 统计信息中。TCP_MIB_OUTSEGS 统计的是发送的 TCP 段的数量。
 		TCP_ADD_STATS(sock_net(sk), TCP_MIB_OUTSEGS,
 			      tcp_skb_pcount(skb));
 
+	// 这行代码更新 TCP 连接的发送段数统计。tp->segs_out 是发送的段总数，tcp_skb_pcount(skb) 返回当前数据包中段的数量。
 	tp->segs_out += tcp_skb_pcount(skb);
-	/* OK, its time to fill skb_shinfo(skb)->gso_{segs|size} */
+
+	// skb_shinfo(skb)->gso_segs 用来设置数据包的段数，tcp_skb_pcount(skb) 返回该数据包中的段数。
+	// GSO（大段分段，Generic Segmentation Offload）：一个优化技术，允许网络设备分割大数据包而不需要操作系统干预
 	skb_shinfo(skb)->gso_segs = tcp_skb_pcount(skb);
+	// 这行代码设置 GSO 大小。tcp_skb_mss(skb) 返回数据包的最大报文段大小（MSS），这是分段时使用的最大单个段的大小。
 	skb_shinfo(skb)->gso_size = tcp_skb_mss(skb);
 
-	/* Leave earliest departure time in skb->tstamp (skb->skb_mstamp_ns) */
-
-	/* Cleanup our debris for IP stacks */
+	// skb->cb 是用于存储与 skb 相关的临时数据。memset 将它清零，以清除可能残留的过时信息。
 	memset(skb->cb, 0, max(sizeof(struct inet_skb_parm),
 			       sizeof(struct inet6_skb_parm)));
 
+	// 根据 TCP 连接的延迟参数 tcp_tx_delay 对数据包的时间戳 skb_mstamp_ns 进行调整
 	tcp_add_tx_delay(skb, tp);
 
+	// queue_xmit 是将数据包提交给网络设备驱动进行发送的操作。它调用与当前地址族（IPv4 或 IPv6）相关的发送函数（更底层的数据发送函数，实际上网络协议栈就是一层调一层，层层加包）。
+	// inet->cork.fl 是用于传输的数据包“夹层”字段，用于合并多条数据（例如，TCP 快速打开、合并传输）。
 	err = icsk->icsk_af_ops->queue_xmit(sk, skb, &inet->cork.fl);
 
+	// 检查 queue_xmit 函数是否返回了一个错误代码。
 	if (unlikely(err > 0)) {
+		// 如果发生了错误，并且该错误可能与网络拥塞控制（CWR，Congestion Window Reduced）有关，进入 CWR 状态。这是为了处理 TCP 拥塞窗口减小的情况。
 		tcp_enter_cwr(sk);
 		err = net_xmit_eval(err);
 	}
+	// 如果没有发生错误，并且 oskb 存在
 	if (!err && oskb) {
+		// 这行代码在发送数据包之后更新 oskb 的状态，prior_wstamp 是先前的时间戳。
 		tcp_update_skb_after_send(sk, oskb, prior_wstamp);
+		// 更新 TCP 发送速率或相关的统计信息，以便根据发送的数据包计算发送速率。
 		tcp_rate_skb_sent(sk, oskb);
 	}
 	return err;
@@ -3550,6 +3640,11 @@ static void tcp_connect_queue_skb(struct sock *sk, struct sk_buff *skb)
  // 这个 Cookie 被保存在客户端（通常是浏览器或应用程序的连接库中），并且 与客户端的 IP 和端口号关联，形成一个缓存。
  // 客户端在之后的 连接请求中可以携带这个 Cookie，而不需要再次进行传统的三次握手中的 SYN 阶段。
  // 服务器验证该 Cookie，若验证成功，就可以直接开始发送数据，而不需要等待三次握手的确认。
+ // 参数介绍
+ // *sk:一个指向套接字 sock 结构体的指针。sk 代表当前的 TCP 套接字，它包含了关于当前 TCP 连接的各种信息，如连接状态、发送队列、接收队列、TCP 状态机等
+ // *syn:一个指向 sk_buff（socket buffer）结构体的指针。
+ // 在 tcp_send_syn_data 函数中，syn 是一个已经构造好的 SYN 包（即 TCP 连接建立的初始包），它用于在 TCP Fast Open 场景下发送到远端。
+ // 这个 sk_buff 包含了即将发送的 SYN 包的信息，比如目标 IP、端口号等。
 static int tcp_send_syn_data(struct sock *sk, struct sk_buff *syn)
 {	
 	// tp：获取与当前套接字关联的 TCP 控制块（tcp_sock）。
@@ -3687,6 +3782,9 @@ done:
 }
 
 /* Build a SYN and send it off. */
+// 构建SYN包并发送
+// 参数介绍：
+// *sk:一个指向 sock 结构体的指针，表示当前的 TCP 套接字.
 int tcp_connect(struct sock *sk)
 {
 	struct tcp_sock *tp = tcp_sk(sk);

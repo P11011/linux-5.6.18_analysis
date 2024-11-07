@@ -195,6 +195,13 @@ static int tcp_v4_pre_connect(struct sock *sk, struct sockaddr *uaddr,
 
 /* This will initiate an outgoing connection. */
 // linux内核构造并发送SYN包；对应三次握手的第一次
+// 参数介绍：
+// *sk：一个指向 sock 结构体的指针，表示当前的 TCP 套接字。
+// sock 结构体包含了与 TCP 连接相关的所有信息，如套接字状态、发送和接收队列、网络层协议状态等。
+// *uaddr：一个指向 sockaddr 结构体的指针，sockaddr 是一个通用的地址结构体，用于存储与协议族相关的地址信息。
+// 在 IPv4 中，它通常被类型转换为 struct sockaddr_in，该结构包含了目标地址的 IP 地址和端口信息。
+// addr_len：该参数表示 uaddr 指向的地址结构的长度。addr_len 用于验证地址结构的有效性，确保其长度正确。
+// 一般情况下，addr_len 的值应该是 sizeof(struct sockaddr_in)
 int tcp_v4_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)
 {
     // 将传入的 sockaddr 类型的 uaddr 强制转换为 sockaddr_in 类型
