@@ -194,137 +194,211 @@ static int tcp_v4_pre_connect(struct sock *sk, struct sockaddr *uaddr,
 }
 
 /* This will initiate an outgoing connection. */
+// linux内核构造并发送SYN包；对应三次握手的第一次
 int tcp_v4_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)
 {
-	struct sockaddr_in *usin = (struct sockaddr_in *)uaddr;
-	struct inet_sock *inet = inet_sk(sk);
-	struct tcp_sock *tp = tcp_sk(sk);
-	__be16 orig_sport, orig_dport;
-	__be32 daddr, nexthop;
-	struct flowi4 *fl4;
-	struct rtable *rt;
-	int err;
-	struct ip_options_rcu *inet_opt;
-	struct inet_timewait_death_row *tcp_death_row = &sock_net(sk)->ipv4.tcp_death_row;
+    // 将传入的 sockaddr 类型的 uaddr 强制转换为 sockaddr_in 类型
+    struct sockaddr_in *usin = (struct sockaddr_in *)uaddr;
+    // 获取套接字的 inet_sock 结构体，用于存放 IPv4 地址信息
+    struct inet_sock *inet = inet_sk(sk);
+    // 获取套接字的 tcp_sock 结构体，用于存放 TCP 特有的状态信息
+    struct tcp_sock *tp = tcp_sk(sk);
+    __be16 orig_sport, orig_dport;
+    __be32 daddr, nexthop;
+    struct flowi4 *fl4;
+    struct rtable *rt;
+    int err;
+    struct ip_options_rcu *inet_opt;
+    // 获取当前进程的 ipv4_tcp_death_row 结构，主要用于 tcp连接断开的处理
+    struct inet_timewait_death_row *tcp_death_row = &sock_net(sk)->ipv4.tcp_death_row;
 
-	if (addr_len < sizeof(struct sockaddr_in))
-		return -EINVAL;
+    // 校验地址长度是否合适，必须大于等于 sockaddr_in 的大小
+	//由于我们是在处理 IPv4 地址，因此传入的 uaddr 必须是 struct sockaddr_in 类型，大小应为 sizeof(struct sockaddr_in),
+	//如果小于其大小可能导致后面操作读取数据时有越界
+    if (addr_len < sizeof(struct sockaddr_in))
+        return -EINVAL;
 
-	if (usin->sin_family != AF_INET)
-		return -EAFNOSUPPORT;
+    // 校验协议族是否为 AF_INET(IPV4)，如果不是则返回不支持的协议错误,即不应该调用当前方法
+    if (usin->sin_family != AF_INET)
+        return -EAFNOSUPPORT;
 
-	nexthop = daddr = usin->sin_addr.s_addr;
-	inet_opt = rcu_dereference_protected(inet->inet_opt,
-					     lockdep_sock_is_held(sk));
-	if (inet_opt && inet_opt->opt.srr) {
-		if (!daddr)
-			return -EINVAL;
-		nexthop = inet_opt->opt.faddr;
-	}
+    // 将目标地址 daddr 和下一跳地址 nexthop 设置为用户提供的目标 IP 地址
+    nexthop = daddr = usin->sin_addr.s_addr;
+    // 获取套接字的 IP 选项
+    inet_opt = rcu_dereference_protected(inet->inet_opt, lockdep_sock_is_held(sk));
 
-	orig_sport = inet->inet_sport;
-	orig_dport = usin->sin_port;
-	fl4 = &inet->cork.fl.u.ip4;
-	rt = ip_route_connect(fl4, nexthop, inet->inet_saddr,
-			      RT_CONN_FLAGS(sk), sk->sk_bound_dev_if,
-			      IPPROTO_TCP,
-			      orig_sport, orig_dport, sk);
-	if (IS_ERR(rt)) {
-		err = PTR_ERR(rt);
-		if (err == -ENETUNREACH)
-			IP_INC_STATS(sock_net(sk), IPSTATS_MIB_OUTNOROUTES);
-		return err;
-	}
+    // 如果启用了来源地址路由 (Source Route)，则选择指定的下一跳地址
+	// 来源路由 (Source Routing) ：网络协议机制，允许数据包的发送者指定其经过的路由路径，
+	// 使用来源路由的模式下，发送者直接指定了转发路径，即下一跳目的存储在 inet_opt->opt.srr
+    if (inet_opt && inet_opt->opt.srr) {
+        if (!daddr)
+            return -EINVAL;
+        nexthop = inet_opt->opt.faddr;
+    }
 
-	if (rt->rt_flags & (RTCF_MULTICAST | RTCF_BROADCAST)) {
-		ip_rt_put(rt);
-		return -ENETUNREACH;
-	}
+    // 获取连接的原始源端口号和目标端口号
+    orig_sport = inet->inet_sport;
+    orig_dport = usin->sin_port;
 
-	if (!inet_opt || !inet_opt->opt.srr)
-		daddr = fl4->daddr;
+    // 获取套接字的 IPv4 地址流信息
+    fl4 = &inet->cork.fl.u.ip4;
 
-	if (!inet->inet_saddr)
-		inet->inet_saddr = fl4->saddr;
-	sk_rcv_saddr_set(sk, inet->inet_saddr);
+    // 查找路由表，选择合适的路由信息
+	// 网络通信中的每个数据包都会经过路由器转发，在内核层，
+	// 需要查找一条合适的路由来决定数据包的发送路径。
+	// ip_route_connect 函数通过提供目标 IP 和源 IP 地址、源端口、目标端口等信息来查找适合的路由表项。
+    rt = ip_route_connect(fl4, nexthop, inet->inet_saddr,
+                          RT_CONN_FLAGS(sk), sk->sk_bound_dev_if,
+                          IPPROTO_TCP,
+                          orig_sport, orig_dport, sk);
+	// 路由表返回的是 rtable 结构，它包含了到目标的路由信息。
+	// 如果 rtable 查询失败，可能是因为网络不可达或者没有合适的路由，
+	// 这时函数会返回 -ENETUNREACH（网络不可达）
+    if (IS_ERR(rt)) {
+        err = PTR_ERR(rt);
+        // 如果路由不可达，增加相关统计
+        if (err == -ENETUNREACH)
+            IP_INC_STATS(sock_net(sk), IPSTATS_MIB_OUTNOROUTES);
+        return err;
+    }
 
-	if (tp->rx_opt.ts_recent_stamp && inet->inet_daddr != daddr) {
-		/* Reset inherited state */
-		tp->rx_opt.ts_recent	   = 0;
-		tp->rx_opt.ts_recent_stamp = 0;
-		if (likely(!tp->repair))
-			WRITE_ONCE(tp->write_seq, 0);
-	}
+    // 如果路由类型为多播或广播，则返回网络不可达错误
+	// TCP 连接要求是点对点的，即通信的双方必须是特定的单一源和单一目标。
+	// 多播和广播是面向多个接收者的，不符合 TCP 协议的点对点连接要求。
+    if (rt->rt_flags & (RTCF_MULTICAST | RTCF_BROADCAST)) {
+        ip_rt_put(rt);
+        return -ENETUNREACH;
+    }
 
-	inet->inet_dport = usin->sin_port;
-	sk_daddr_set(sk, daddr);
+    // 如果没有启用来源地址路由，则使用查找到的路由的目的地址
+    if (!inet_opt || !inet_opt->opt.srr)
+        daddr = fl4->daddr;
 
-	inet_csk(sk)->icsk_ext_hdr_len = 0;
-	if (inet_opt)
-		inet_csk(sk)->icsk_ext_hdr_len = inet_opt->opt.optlen;
+    // 如果源地址没有设置，使用路由查找到的源地址
+	// 这个源地址通常是与目标地址最优匹配(根据不同的路由算法确定，通常拥有最少路由间跳转次数)的本地接口的 IP 地址。
+	// 此处保证了数据包能够从正确的本地 IP 地址发出，特别是在一台主机有多个网络接口或 IP 地址时
+    if (!inet->inet_saddr)
+        inet->inet_saddr = fl4->saddr;
 
-	tp->rx_opt.mss_clamp = TCP_MSS_DEFAULT;
+    // 设置套接字的源地址
+    sk_rcv_saddr_set(sk, inet->inet_saddr);
 
-	/* Socket identity is still unknown (sport may be zero).
-	 * However we set state to SYN-SENT and not releasing socket
-	 * lock select source port, enter ourselves into the hash tables and
-	 * complete initialization after this.
-	 */
-	tcp_set_state(sk, TCP_SYN_SENT);
-	err = inet_hash_connect(tcp_death_row, sk);
-	if (err)
-		goto failure;
+    // 如果 TCP 连接之前已经有时间戳并且目标地址与当前目标地址不同，清空时间戳缓存
+	// TCP 实现中通常会缓存时间戳用于优化和提高数据包的重传决策速度(比如快速重传、重传超时的计算)
+	// 如果目标地址已更改，原来的时间戳缓存不再适用，就需要清除它们。
+    if (tp->rx_opt.ts_recent_stamp && inet->inet_daddr != daddr) {
+        tp->rx_opt.ts_recent = 0;
+        tp->rx_opt.ts_recent_stamp = 0;
+        if (likely(!tp->repair))
+            WRITE_ONCE(tp->write_seq, 0);
+    }
 
-	sk_set_txhash(sk);
+    // 设置目标端口
+    inet->inet_dport = usin->sin_port;
+    // 设置套接字的目标地址
+    sk_daddr_set(sk, daddr);
 
-	rt = ip_route_newports(fl4, rt, orig_sport, orig_dport,
-			       inet->inet_sport, inet->inet_dport, sk);
-	if (IS_ERR(rt)) {
-		err = PTR_ERR(rt);
-		rt = NULL;
-		goto failure;
-	}
-	/* OK, now commit destination to socket.  */
-	sk->sk_gso_type = SKB_GSO_TCPV4;
-	sk_setup_caps(sk, &rt->dst);
-	rt = NULL;
+    // 设置 TCP 扩展头的长度
+	// TCP 扩展头用于支持一些额外的 TCP 选项，比如 时间戳选项、选择确认（SACK）、窗口扩大因子（WScale） 等
+	// TCP 报文头通常是 20 字节，但如果启用了额外选项（例如时间戳、SACK 等），则扩展头会增加报文头的总长度。
+    // icsk_ext_hdr_len 字段告诉内核该 TCP 连接的扩展头有多长。在发送数据包时，内核会根据这个值来构造正确大小的 TCP 报文头。
+    inet_csk(sk)->icsk_ext_hdr_len = 0;
+    if (inet_opt)
+        inet_csk(sk)->icsk_ext_hdr_len = inet_opt->opt.optlen;
 
-	if (likely(!tp->repair)) {
-		if (!tp->write_seq)
-			WRITE_ONCE(tp->write_seq,
-				   secure_tcp_seq(inet->inet_saddr,
-						  inet->inet_daddr,
-						  inet->inet_sport,
-						  usin->sin_port));
-		tp->tsoffset = secure_tcp_ts_off(sock_net(sk),
-						 inet->inet_saddr,
-						 inet->inet_daddr);
-	}
+    // MSS (Maximum Segment Size) TCP 数据段的最大字节数。
+	// 在建立连接时，TCP 会基于网络环境设置 MSS，防止发送的 TCP 数据包过大导致网络问题。
+	// TCP_MSS_DEFAULT 是默认的 MSS 值
+    tp->rx_opt.mss_clamp = TCP_MSS_DEFAULT;
 
-	inet->inet_id = prandom_u32();
+	// 当客户端发起 TCP 连接时，必须将套接字的状态设置为 TCP_SYN_SENT，
+	// 这表示客户端已经发送了一个 SYN 包，并等待服务器的响应。
+    tcp_set_state(sk, TCP_SYN_SENT);
 
-	if (tcp_fastopen_defer_connect(sk, &err))
-		return err;
-	if (err)
-		goto failure;
+    // 将套接字加入到哈希表，便于快速查找和管理已经连接的套接字
+    err = inet_hash_connect(tcp_death_row, sk);
+    if (err)
+        goto failure;
 
-	err = tcp_connect(sk);
+    // 设置套接字的发送哈希值，
+	// 通过计算并设置一个发送哈希值，它确保了相同连接的数据包始终发送到相同的队列，
+	// “多队列网卡与负载均衡”：现代网络接口卡（NIC）通常支持 多队列，即一个网卡可以有多个硬件队列来并行处理流量。
+	// 这使得网络流量能够在多个 CPU 核心之间分配，增加了网络吞吐量和降低了延迟。
+    // 但在多队列的情况下，为了高效地分配流量到各个队列，需要确保同一个连接的所有数据包始终发送到相同的队列。
+	// 如果同一连接的不同数据包被发送到不同的队列，可能会导致数据包顺序乱序，甚至需要重新排序，增加了网络处理的复杂性。
+    sk_set_txhash(sk);
 
-	if (err)
-		goto failure;
+    // 更新路由信息，并确保目标端口和源端口正确匹配
+	// 在ip_route_connect时的路由查找并没有完全完成，因为 ip_route_connect 主要关注的是最优路由选择，
+	// ip_route_connect假设源端口和目标端口已经确定，
+	// 但实际上TCP 连接的端口（源端口和目标端口）在某些情况(端口重绑定、 负载均衡和端口重写等)下可能会发生变化
+	// 因此，ip_route_newports 确保源端口和目标端口在路由表项中正确反映，
+	// 并且可能会做一些调整或分配，它补充了 ip_route_connect 的不足，确保端口信息正确后返回最终的路由表项。
+	// 端口重绑定：在某些情况下，TCP 套接字在连接建立后可能会通过 bind() 系统调用将端口重新绑定到新的地址或端口
+	// 负载均衡和端口重写：在负载均衡场景下，负载均衡器可能会改变目标端口或源端口，以决定流量转发到哪个服务器或哪个端口。
+	// 比如，负载均衡器可能会将客户端的请求转发到不同的后端服务器，并可能改变目标端口。
+    rt = ip_route_newports(fl4, rt, orig_sport, orig_dport,
+                           inet->inet_sport, inet->inet_dport, sk);
+    if (IS_ERR(rt)) {
+        err = PTR_ERR(rt);
+        rt = NULL;
+        goto failure;
+    }
 
-	return 0;
+    // 现在路由信息和目标地址都已确定，开始进行 GSO 和路由处理
+	// GSO 是一种由网络硬件或操作系统网络栈处理的技术，旨在优化大数据包的分段（Segmentation）。
+	// 其基本原理是允许网络栈将大的传出数据包分段交给硬件或网络驱动程序，而不是在应用层进行数据包的分割。
+	// SKB_GSO_TCPV4：这个值表示我们正在使用的是 TCPv4 协议的 GSO
+    sk->sk_gso_type = SKB_GSO_TCPV4;
+	// 设置套接字值，确保套接字 sk 能够使用正确的路由信息和网络能力（如 GSO）进行数据传输。
+    sk_setup_caps(sk, &rt->dst);
+    rt = NULL;
+
+    // 如果没有开启 TCP 修复模式，则设置初始的 TCP 序列号和时间戳偏移
+	// TCP 修复模式（TCP Repair Mode） 是一种在 Linux 内核中用于调试、测试和实验的特殊模式，不需要设置这些
+    if (likely(!tp->repair)) {
+        if (!tp->write_seq)
+            WRITE_ONCE(tp->write_seq,
+                       secure_tcp_seq(inet->inet_saddr,
+                                      inet->inet_daddr,
+                                      inet->inet_sport,
+                                      usin->sin_port));
+        tp->tsoffset = secure_tcp_ts_off(sock_net(sk),
+                                         inet->inet_saddr,
+                                         inet->inet_daddr);
+    }
+
+    // 为连接分配一个唯一的 ID
+    inet->inet_id = prandom_u32();
+
+    // 如果启用了 TCP Fast Open(一种优化的 TCP 连接建立方法,允许客户端在发送 SYN 时直接携带数据)，则延迟连接，直到发送 SYN 包
+	// 内容于传统三次握手有所不同，感兴趣的可以自行去搜集资料学习
+    if (tcp_fastopen_defer_connect(sk, &err))
+        return err;
+    if (err)
+        goto failure;
+
+    // 发起实际的连接
+    err = tcp_connect(sk);
+
+    // 如果连接失败，跳转到失败处理
+    if (err)
+        goto failure;
+
+    // 成功，返回 0
+    return 0;
 
 failure:
-	/*
-	 * This unhashes the socket and releases the local port,
-	 * if necessary.
-	 */
-	tcp_set_state(sk, TCP_CLOSE);
-	ip_rt_put(rt);
-	sk->sk_route_caps = 0;
-	inet->inet_dport = 0;
-	return err;
+    // 如果连接失败，进行清理，回到关闭状态
+	// 这个函数会将套接字的状态设置为 TCP_CLOSE。这意味着当前 TCP 连接已经失败或关闭，任何剩余的连接处理都会被停止。
+    tcp_set_state(sk, TCP_CLOSE);
+	// 释放与连接相关的路由信息。如果连接过程中查找路由表时创建了 rtable（路由表项），当连接失败时，必须释放这些资源。
+    ip_rt_put(rt);
+	// 该字段表示套接字与路由的能力设置。当连接失败时，需要将此字段清零，表示该套接字与路由的关联已经取消或失效。
+    sk->sk_route_caps = 0;
+	// inet_dport 是套接字的目标端口字段。在连接失败时，将其重置为 0，表示当前没有有效的目标端口。
+    inet->inet_dport = 0;
+    return err;
 }
 EXPORT_SYMBOL(tcp_v4_connect);
 
