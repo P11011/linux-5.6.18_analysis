@@ -3543,23 +3543,39 @@ static void tcp_connect_queue_skb(struct sock *sk, struct sk_buff *skb)
  * If cookie is not cached or other error occurs, falls back to send a
  * regular SYN with Fast Open cookie request option.
  */
+ // 这段代码的目标是尝试发送一个 带数据的 SYN 包。如果无法发送带数据的 SYN（比如 Cookie 缓存不可用），
+ // 则回退到常规的 SYN 包，并附带 Fast Open Cookie 请求选项。
+ // 代码说明了如果发送失败（如 Cookie 不可用或其他错误），将会回退到常规的 SYN 连接请求
+ // Fast Open Cookie:在第一次连接时，服务器会生成一个 Fast Open Cookie 并返回给客户端。
+ // 这个 Cookie 被保存在客户端（通常是浏览器或应用程序的连接库中），并且 与客户端的 IP 和端口号关联，形成一个缓存。
+ // 客户端在之后的 连接请求中可以携带这个 Cookie，而不需要再次进行传统的三次握手中的 SYN 阶段。
+ // 服务器验证该 Cookie，若验证成功，就可以直接开始发送数据，而不需要等待三次握手的确认。
 static int tcp_send_syn_data(struct sock *sk, struct sk_buff *syn)
-{
+{	
+	// tp：获取与当前套接字关联的 TCP 控制块（tcp_sock）。
+	// fo：获取当前连接的 Fast Open 请求（tcp_fastopen_request），该结构体保存了与 Fast Open 相关的所有信息。
+	// space：表示可以用于数据的空间大小。
+	// err：用于存储函数调用的返回值。
+	// syn_data：指向新分配的带数据的 SYN 包。
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct tcp_fastopen_request *fo = tp->fastopen_req;
 	int space, err = 0;
 	struct sk_buff *syn_data;
 
+	//设置 MSS（最大段大小）：如果没有缓存的 MSS，使用 tp->advmss 来设置接收端的最大段大小。
 	tp->rx_opt.mss_clamp = tp->advmss;  /* If MSS is not cached */
+	// 调用 tcp_fastopen_cookie_check() 函数检查是否有有效的 Fast Open Cookie，
+	// 这个函数会确认是否可以使用已缓存的 Cookie。如果没有有效的 Cookie，或者出现其他问题，则跳转到回退部分。
 	if (!tcp_fastopen_cookie_check(sk, &tp->rx_opt.mss_clamp, &fo->cookie))
 		goto fallback;
 
-	/* MSS for SYN-data is based on cached MSS and bounded by PMTU and
-	 * user-MSS. Reserve maximum option space for middleboxes that add
-	 * private TCP options. The cost is reduced data space in SYN :(
-	 */
+
+	// 使用tcp_mss_clamp调整 MSS：tcp_mss_clamp() 函数根据路径 MTU 和其他因素调整 MSS
 	tp->rx_opt.mss_clamp = tcp_mss_clamp(tp, tp->rx_opt.mss_clamp);
 
+	// 该部分在计算剩余空间
+	// space 计算出可以用于数据的最大空间，受到 MTU 和 TCP 选项大小（包括可能的中间设备修改）的限制。
+	// fo->size 是请求发送的数据大小
 	space = __tcp_mtu_to_mss(sk, inet_csk(sk)->icsk_pmtu_cookie) -
 		MAX_TCP_OPTION_SPACE;
 
@@ -3568,36 +3584,47 @@ static int tcp_send_syn_data(struct sock *sk, struct sk_buff *syn)
 	/* limit to order-0 allocations */
 	space = min_t(size_t, space, SKB_MAX_HEAD(MAX_TCP_HEADER));
 
+	// 分配一个新的 sk_buff（网络数据包缓冲区）来存放带数据的 SYN 包。space 是可用的空间。
 	syn_data = sk_stream_alloc_skb(sk, space, sk->sk_allocation, false);
 	if (!syn_data)
 		goto fallback;
+	// CHECKSUM_PARTIAL 设置表示部分校验和，后续发送时需要重新计算。
 	syn_data->ip_summed = CHECKSUM_PARTIAL;
+	// memcpy 将原始 SYN 包的控制块（cb）复制到新的 SYN 数据包中，以保留相关信息。
 	memcpy(syn_data->cb, syn->cb, sizeof(syn->cb));
+	// 如果 space 大于 0（有数据需要发送），则将数据从 fo->data->msg_iter 复制到 syn_data 中。
 	if (space) {
+		// copy_from_iter 将数据从用户空间复制到内核中的 sk_buff（syn_data）中
 		int copied = copy_from_iter(skb_put(syn_data, space), space,
 					    &fo->data->msg_iter);
+		// 如果复制失败（copied == 0），则清理并释放分配的内存，并跳转到回退部分。
 		if (unlikely(!copied)) {
 			tcp_skb_tsorted_anchor_cleanup(syn_data);
 			kfree_skb(syn_data);
 			goto fallback;
 		}
+		// 如果复制的数据量少于预期，则修剪数据包，并更新 space
 		if (copied != space) {
 			skb_trim(syn_data, copied);
 			space = copied;
 		}
 		skb_zcopy_set(syn_data, fo->uarg, NULL);
 	}
-	/* No more data pending in inet_wait_for_connect() */
+	// 如果数据已经完全复制到 SYN 数据包中（即 space == fo->size），
+	// 则将 fo->data 置为 NULL，表示没有更多数据需要发送。
 	if (space == fo->size)
 		fo->data = NULL;
+	// 更新 fo->copied，记录已复制的字节数
 	fo->copied = space;
-
+	// 将 syn_data 加入发送队列 tcp_connect_queue_skb，并启动定时器（tcp_chrono_start），表示连接正在忙于数据传输。
 	tcp_connect_queue_skb(sk, syn_data);
 	if (syn_data->len)
 		tcp_chrono_start(sk, TCP_CHRONO_BUSY);
 
+	// 通过 tcp_transmit_skb() 函数发送 syn_data 数据包。
 	err = tcp_transmit_skb(sk, syn_data, 1, sk->sk_allocation);
 
+	// 更新 syn 包的时间戳为 syn_data 包的时间戳，确保时间同步。
 	syn->skb_mstamp_ns = syn_data->skb_mstamp_ns;
 
 	/* Now full SYN+DATA was cloned and sent (or not),
@@ -3605,25 +3632,54 @@ static int tcp_send_syn_data(struct sock *sk, struct sk_buff *syn)
 	 * we keep in write queue in case of a retransmit, as we
 	 * also have the SYN packet (with no data) in the same queue.
 	 */
+	// 更新序列号
 	TCP_SKB_CB(syn_data)->seq++;
+	//这行代码设置 syn_data 数据包的 TCP 标志位。
+	// tcp_flags 字段用于指定该数据包的 TCP 标志
+	// TCPHDR_ACK：表示这是一个 确认包（ACK）。SYN-ACK 包会携带此标志，表示接收到客户端的 SYN 包，并准备好继续连接过程。
+	// TCPHDR_PSH：表示数据包携带 推送（PSH）标志。PSH 标志告诉接收方，这个数据包的数据应该立即交给上层应用处理，而不是在缓冲区中等待更多的数据。
 	TCP_SKB_CB(syn_data)->tcp_flags = TCPHDR_ACK | TCPHDR_PSH;
+	// 如果没有报错
 	if (!err) {
+		// 这行代码更新 tp->syn_data，表示 是否成功发送数据。
+		// fo->copied 存储了已成功发送的数据量（例如，Fast Open 请求的数据）。
+		// 如果 fo->copied > 0，则表示客户端成功地在 SYN 包中携带了数据，因此设置 tp->syn_data 为 true（1），表示已经发送了带数据的 SYN 包。
+		// 否则为false，表示没有发送
 		tp->syn_data = (fo->copied > 0);
+		// 将 syn_data（带数据的 SYN 包）插入到 重传队列（Retransmission Queue） 中。
+		// sk->tcp_rtx_queue 是一个用于存储待重传的 TCP 数据包的红黑树。
+		// 即使数据包已被发送，它仍然可能需要在连接过程中进行重传（例如，如果对方没有收到数据包或者连接超时），因此将其插入重传队列中是必要的。
 		tcp_rbtree_insert(&sk->tcp_rtx_queue, syn_data);
+		// 调用 NET_INC_STATS 宏来增加 TCP 原始数据包发送统计量（LINUX_MIB_TCPORIGDATASENT）。
+		// 该统计量记录了发送的原始 TCP 数据量，用于系统的流量监控和调优
 		NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPORIGDATASENT);
+		// 收尾
 		goto done;
 	}
 
-	/* data was not sent, put it in write_queue */
+	// 走到这说明err不为0，存在报错
+	// 这行代码将 syn_data（代表带数据的 SYN 包）加入到套接字的写队列（sk_write_queue）中。
+	// sk_write_queue 是一个双向链表，存储待发送的网络数据包。
+	// 如果数据包没有成功发送，它会被放到这个队列中，以便稍后重新尝试发送。
 	__skb_queue_tail(&sk->sk_write_queue, syn_data);
+	// 这行代码减少 tp->packets_out 计数器的值，表示当前连接待发送的数据包数量减少。
+	// tcp_skb_pcount(syn_data) 计算当前 syn_data 数据包的包计数（例如一个数据包可以包含多个 TCP 段），然后从 packets_out 中减去这个计数
+	// 更新当前连接待发送的 TCP 包数。
 	tp->packets_out -= tcp_skb_pcount(syn_data);
 
+// 这里是代码的回退标记。在出现错误的情况下，跳转到 fallback 位置，执行备用的处理逻辑。主要是发送一个标准的 SYN 包，而不包括数据。
 fallback:
-	/* Send a regular SYN with Fast Open cookie request option */
+	// 将 Fast Open cookie 的长度重置为 0
+	// 在 TFO 过程中，如果出现某些错误（如无法发送数据），客户端可能需要重新发送一个标准的 SYN 包（即不带数据的 SYN 包）。
+	// 次时，需要清除之前的 Fast Open cookie 信息，以防止在下次发送时使用过时的 cookie。
 	if (fo->cookie.len > 0)
 		fo->cookie.len = 0;
+	// 如果数据未能发送，代码会尝试通过 tcp_transmit_skb 函数发送 标准的 SYN 包（即不带数据的 SYN 包）。
+	// tcp_transmit_skb 函数负责将指定的 sk_buff（此处是 syn）传输到网络上
 	err = tcp_transmit_skb(sk, syn, 1, sk->sk_allocation);
 	if (err)
+		// 如果 tcp_transmit_skb 返回错误（即数据包没有成功发送），则设置 tp->syn_fastopen = 0;。
+		// 表示 Fast Open 连接尝试失败，将 syn_fastopen 标志置为 0，表示当前连接不再使用 TCP Fast Open。
 		tp->syn_fastopen = 0;
 done:
 	fo->cookie.len = -1;  /* Exclude Fast Open option for SYN retries */
