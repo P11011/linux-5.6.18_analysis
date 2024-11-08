@@ -1029,36 +1029,60 @@ static void tcp_v4_reqsk_send_ack(const struct sock *sk, struct sk_buff *skb,
 			ip_hdr(skb)->tos);
 }
 
-/*
- *	Send a SYN-ACK after having received a SYN.
- *	This still operates on a request_sock only, not on a big
- *	socket.
- */
+// 在接收到一个 SYN 请求后发送一个 SYN-ACK 响应。此时操作的是一个 request_sock 结构，而不是一个完整的 TCP 套接字（big socket）。
+// request_sock 是 TCP 三次握手过程中用于存储连接请求信息的一个临时数据结构。
+// 参数介绍：
+// sk: 当前的 sock 结构，表示一个 TCP 套接字。
+// dst: 目标路由的 dst_entry 结构，用于发送数据包的目的地。
+// fl: 与路由和流相关的元数据结构。
+// req: 一个 request_sock，表示待处理的 TCP 连接请求。
+// foc: 一个 tcp_fastopen_cookie 结构，表示快速打开（Fast Open）相关的 cookie（如果存在的话）。
+// synack_type: 一个枚举类型，用于指定 SYN-ACK 类型（例如，标准 SYN-ACK 或快速打开类型）。
 static int tcp_v4_send_synack(const struct sock *sk, struct dst_entry *dst,
 			      struct flowi *fl,
 			      struct request_sock *req,
 			      struct tcp_fastopen_cookie *foc,
 			      enum tcp_synack_type synack_type)
-{
+{	// 将 request_sock 结构（req）转换为一个 inet_request_sock 结构。
+    // inet_rsk 是一个宏，用于从 request_sock 获取与 IPv4 网络相关的额外信息。
 	const struct inet_request_sock *ireq = inet_rsk(req);
 	struct flowi4 fl4;
 	int err = -1;
 	struct sk_buff *skb;
 
-	/* First, grab a route. */
+	// 检查 dst 是否为空。如果 dst 是空的，表示我们需要为该请求找到一条路由。
+	// 使用 inet_csk_route_req 函数根据 sk（套接字），fl4（IPv4 路由信息），
+	// 和 req（请求连接）获取一个路由。若无法找到路由，函数返回 -1，表示失败。
 	if (!dst && (dst = inet_csk_route_req(sk, &fl4, req)) == NULL)
 		return -1;
-
+	// tcp_make_synack 函数生成一个 SYN-ACK 数据包。sk 是当前的套接字，dst 是目标路由，req 是请求连接，foc 是 TCP 快速打开的 cookie（如果有的话），
+	// synack_type 指定 SYN-ACK 的类型。该函数将构造一个 TCP SYN-ACK 包，并返回一个指向 skb 的指针。
+	// 这是核心构造函数，后面会详细介绍
 	skb = tcp_make_synack(sk, dst, req, foc, synack_type);
 
+	// 检查是否成功创建了 skb，即是否成功构建了 SYN-ACK 数据包。
 	if (skb) {
+		// 调用 __tcp_v4_send_check 函数进行发送前的检查和校验。
+		// 它会根据源地址（ireq->ir_loc_addr）和目的地址（ireq->ir_rmt_addr）对数据包进行一些网络层检查。
 		__tcp_v4_send_check(skb, ireq->ir_loc_addr, ireq->ir_rmt_addr);
 
+		// 进入 RCU（Read-Copy-Update）临界区。
+		// RCU：一种用于并发访问共享数据结构的同步机制。在该区块内，我们可以安全地读取共享数据。
 		rcu_read_lock();
+		// ip_build_and_send_pkt 函数将 skb 数据包发送到网络中。该函数的参数如下：
+		// skb: 要发送的数据包。
+		// sk: 当前的 TCP 套接字。
+		// ireq->ir_loc_addr: 源地址（本地地址）。
+		// ireq->ir_rmt_addr: 目的地址（远程地址）。
+		// rcu_dereference(ireq->ireq_opt): 从 RCU 中安全地获取请求的 TCP 选项。
+		// 此处函数将尝试发送构建的包，并将返回值赋给 err
 		err = ip_build_and_send_pkt(skb, sk, ireq->ir_loc_addr,
 					    ireq->ir_rmt_addr,
 					    rcu_dereference(ireq->ireq_opt));
+		// 退出 RCPU 临界区，结束共享数据读取。
 		rcu_read_unlock();
+		// 调用 net_xmit_eval 函数，评估数据包发送的结果。
+		// 这个函数会对网络传输的结果进行评估，确保返回一个合理的值。
 		err = net_xmit_eval(err);
 	}
 
