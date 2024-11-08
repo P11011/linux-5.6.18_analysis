@@ -1076,6 +1076,7 @@ static int tcp_v4_send_synack(const struct sock *sk, struct dst_entry *dst,
 		// ireq->ir_rmt_addr: 目的地址（远程地址）。
 		// rcu_dereference(ireq->ireq_opt): 从 RCU 中安全地获取请求的 TCP 选项。
 		// 此处函数将尝试发送构建的包，并将返回值赋给 err
+		// 后面会详细介绍这个方法
 		err = ip_build_and_send_pkt(skb, sk, ireq->ir_loc_addr,
 					    ireq->ir_rmt_addr,
 					    rcu_dereference(ireq->ireq_opt));

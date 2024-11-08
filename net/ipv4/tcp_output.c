@@ -3406,111 +3406,144 @@ int tcp_send_synack(struct sock *sk)
 	return tcp_transmit_skb(sk, skb, 1, GFP_ATOMIC);
 }
 
-/**
- * tcp_make_synack - Prepare a SYN-ACK.
- * sk: listener socket
- * dst: dst entry attached to the SYNACK
- * req: request_sock pointer
- *
- * Allocate one skb and build a SYNACK packet.
- * @dst is consumed : Caller should not use it again.
- */
+// 构建一个 TCP SYN-ACK 数据包，并返回一个 sk_buff（socket buffer）。
+// 它用于生成 TCP 三次握手过程中的 SYN-ACK 包
+// 参数介绍：
+// sk 是监听套接字（即服务器端的套接字）。
+// dst 是指向目标路由条目的指针，它附加到 SYN-ACK 数据包上。
+// req 是指向 request_sock 结构的指针，表示当前正在处理的连接请求。
 struct sk_buff *tcp_make_synack(const struct sock *sk, struct dst_entry *dst,
 				struct request_sock *req,
 				struct tcp_fastopen_cookie *foc,
 				enum tcp_synack_type synack_type)
-{
+{	// 将 request_sock 结构 req 转换为 inet_request_sock 结构。
 	struct inet_request_sock *ireq = inet_rsk(req);
+	// 将 sk（监听套接字）转换为 tcp_sock 结构，获取当前套接字的 TCP 状态信息。tcp_sk 是用于访问 TCP 套接字内部结构的宏。
 	const struct tcp_sock *tp = tcp_sk(sk);
+	// 声明一个指针 md5，用于存储 TCP MD5 签名密钥（如果启用的话）。该密钥用于验证数据包的完整性，防止篡改。
 	struct tcp_md5sig_key *md5 = NULL;
+	// 存储 TCP 数据包的选项信息
 	struct tcp_out_options opts;
+	// 存储构建的 SYN-ACK 数据包
 	struct sk_buff *skb;
+	// 存储计算出的 TCP 头部大小
 	int tcp_header_size;
+	// 指向 tcphdr（TCP 头部）结构的指针。这个指针将用来操作 SYN-ACK 数据包的 TCP 头部。
 	struct tcphdr *th;
+	// 用于存储最大报文段大小（Maximum Segment Size）	
 	int mss;
+	// u64 类型的变量 now，用于存储当前的时间戳。
 	u64 now;
 
+	// 调用 alloc_skb 函数分配一个大小为 MAX_TCP_HEADER 的 sk_buff（socket buffer）内存。
+	// 如果分配失败（skb 为 NULL），则释放目标路由条目 dst 并返回 NULL，表示失败。
 	skb = alloc_skb(MAX_TCP_HEADER, GFP_ATOMIC);
 	if (unlikely(!skb)) {
 		dst_release(dst);
 		return NULL;
 	}
-	/* Reserve space for headers. */
+	// 为 skb 保留空间以存储 TCP 头部。skb_reserve 会调整 skb 的头部指针，确保有足够的空间来存放 TCP 头部。
 	skb_reserve(skb, MAX_TCP_HEADER);
 
+	// 根据 synack_type（SYN-ACK 类型）决定如何设置 skb 的拥有者。
 	switch (synack_type) {
 	case TCP_SYNACK_NORMAL:
+		// skb_set_owner_w 设置当前 skb 的拥有者：
+		// TCP_SYNACK_NORMAL：设置拥有者为与请求相关的套接字
 		skb_set_owner_w(skb, req_to_sk(req));
 		break;
 	case TCP_SYNACK_COOKIE:
-		/* Under synflood, we do not attach skb to a socket,
-		 * to avoid false sharing.
-		 */
+		// TCP_SYNACK_COOKIE：不设置拥有者，因为在 SYN flood 攻击中，防止共享。
 		break;
 	case TCP_SYNACK_FASTOPEN:
-		/* sk is a const pointer, because we want to express multiple
-		 * cpu might call us concurrently.
-		 * sk->sk_wmem_alloc in an atomic, we can promote to rw.
-		 */
+		// TCP_SYNACK_FASTOPEN：设置拥有者为监听套接字 sk。
 		skb_set_owner_w(skb, (struct sock *)sk);
 		break;
 	}
+	// 将目标路由条目 dst 绑定到 skb。这告诉网络层将数据包发送到哪个目的地。
 	skb_dst_set(skb, dst);
 
+	// 计算最大报文段大小（MSS），调用 tcp_mss_clamp 函数对 MSS 进行限制，
+	// tcp_mss_clamp它根据目标网络的最大传输单元（MTU）来调整 MSS，确保传输的数据包不会超过网络链路的最大可传输大小
+	// dst_metric_advmss(dst) 提供目标路由的最大 MSS
 	mss = tcp_mss_clamp(tp, dst_metric_advmss(dst));
 
+	// 清空 opts 结构，确保其中没有未初始化的数据
 	memset(&opts, 0, sizeof(opts));
+	// 获取当前时间戳，单位为纳秒
 	now = tcp_clock_ns();
+//设置 skb 的时间戳。如果启用了 SYN cookie（CONFIG_SYN_COOKIES），则通过 cookie_init_timestamp 函数初始化时间戳。否则，直接使用当前时间戳。
 #ifdef CONFIG_SYN_COOKIES
 	if (unlikely(req->cookie_ts))
+		// 启用了 SYN cookie（CONFIG_SYN_COOKIES），则通过 cookie_init_timestamp 函数初始化时间戳
 		skb->skb_mstamp_ns = cookie_init_timestamp(req, now);
 	else
 #endif
-	{
+	{	//将 skb_mstamp_ns 字段设置为当前的时间戳 now
 		skb->skb_mstamp_ns = now;
-		if (!tcp_rsk(req)->snt_synack) /* Timestamp first SYNACK */
+		// 如果 req（即请求套接字）中的 snt_synack 字段还没有设置（即为 0 或 NULL），就为它分配一个时间戳。
+		if (!tcp_rsk(req)->snt_synack) 
 			tcp_rsk(req)->snt_synack = tcp_skb_timestamp_us(skb);
 	}
 
+//如果启用了 TCP MD5 签名（CONFIG_TCP_MD5SIG），则通过 req_md5_lookup 获取 MD5 密钥。
 #ifdef CONFIG_TCP_MD5SIG
+	// rcu_read_lock 上锁用于保护 RCU 数据访问
 	rcu_read_lock();
 	md5 = tcp_rsk(req)->af_specific->req_md5_lookup(sk, req_to_sk(req));
 #endif
+	// 为skb设置TCP的 hash 值，方便后请求放入对应队列用于负载均衡
 	skb_set_hash(skb, tcp_rsk(req)->txhash, PKT_HASH_TYPE_L4);
+	// 调用tcp_synack_options 函数生成SYN-ACK数据包的选项，返回的tcp_header_size包括TCP头部和选项的总大小。
 	tcp_header_size = tcp_synack_options(sk, req, mss, skb, &opts, md5,
 					     foc) + sizeof(*th);
 
+	//通过 skb_push 将 TCP 头部推入 skb，并重置传输层头部指针
 	skb_push(skb, tcp_header_size);
 	skb_reset_transport_header(skb);
 
+	//设置 skb 的 TCP 头部。首先将其清零，然后设置 SYN 和 ACK 标志位，表示这是一个 SYN-ACK 包
 	th = (struct tcphdr *)skb->data;
 	memset(th, 0, sizeof(struct tcphdr));
 	th->syn = 1;
 	th->ack = 1;
+	// 设置 ECN（显式拥塞通知）相关的选项
 	tcp_ecn_make_synack(req, th);
+	// 设置源端口和目的端口，ireq->ir_num 是源端口，ireq->ir_rmt_port 是目标端口
 	th->source = htons(ireq->ir_num);
 	th->dest = ireq->ir_rmt_port;
+	// 设置 skb 的标记字段和校验和字段。CHECKSUM_PARTIAL 表示只计算部分校验和
 	skb->mark = ireq->ir_mark;
 	skb->ip_summed = CHECKSUM_PARTIAL;
+	// 设置序列号和确认号。snt_isn 是发送的初始序列号，rcv_nxt 是接收到的下一个序列号
 	th->seq = htonl(tcp_rsk(req)->snt_isn);
-	/* XXX data is queued and acked as is. No buffer/window check */
 	th->ack_seq = htonl(tcp_rsk(req)->rcv_nxt);
 
-	/* RFC1323: The window in SYN & SYN/ACK segments is never scaled. */
+	// 设置窗口大小。根据接收窗口大小和 65535 的最小值来设置
 	th->window = htons(min(req->rsk_rcv_wnd, 65535U));
+	// 写入 TCP 选项到 TCP 头部之后的地方
 	tcp_options_write((__be32 *)(th + 1), NULL, &opts);
+	//设置 TCP 头部的长度
 	th->doff = (tcp_header_size >> 2);
+	// 更新 TCP 输出段统计
 	__TCP_INC_STATS(sock_net(sk), TCP_MIB_OUTSEGS);
 
+// 检查是否启用了 TCP MD5 签名功能，启用了则执行以下代码
 #ifdef CONFIG_TCP_MD5SIG
-	/* Okay, we have all we need - do the md5 hash if needed */
+	// 这里检查 md5 是否有效，即是否为非 NULL。如果存在 MD5 密钥（即 md5 不为空），则会计算 MD5 签名
 	if (md5)
+		// 如果启用了 MD5 签名支持，SYN-ACK 包将会通过该 MD5 密钥生成哈希并附加到包中，以增强安全性，确保数据包未被篡改
+		// 这里调用 calc_md5_hash 来计算 MD5 哈希，确保 SYN-ACK 包在发送时携带正确的 MD5 签名
 		tcp_rsk(req)->af_specific->calc_md5_hash(opts.hash_location,
 					       md5, req_to_sk(req), skb);
+	// 这是解除 RCU（Read-Copy-Update）锁的操作。由于 MD5 签名的计算可能需要访问共享数据（如请求套接字中的 af_specific），
+	// 因此在进入该代码块前，代码会使用 rcu_read_lock() 来保护共享资源
 	rcu_read_unlock();
 #endif
-
+	// 设置 SYN-ACK 数据包的时间戳。now 是之前通过 tcp_clock_ns() 获取的当前时间戳（单位为纳秒）。
+	// 此字段 skb->skb_mstamp_ns 用于记录该数据包的时间戳，通常用于测量延迟、计算 RTT 等。
 	skb->skb_mstamp_ns = now;
+	// 将一个发送延迟加到 skb（即 SYN-ACK 数据包）上
 	tcp_add_tx_delay(skb, tp);
 
 	return skb;
