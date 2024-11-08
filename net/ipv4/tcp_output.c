@@ -3962,21 +3962,26 @@ void tcp_send_delayed_ack(struct sock *sk)
 	sk_reset_timer(sk, &icsk->icsk_delack_timer, timeout);
 }
 
-/* This routine sends an ack and also updates the window. */
+// 送一个 TCP ACK 包（确认包），并且更新接收窗口
+// 参数介绍：
+// sk：指向当前套接字（struct sock）的指针，表示当前的 TCP 连接。
+// rcv_nxt：是接收窗口中的下一个期望的序列号，用于确定发送的 ACK 包的序列号。
 void __tcp_send_ack(struct sock *sk, u32 rcv_nxt)
 {
 	struct sk_buff *buff;
 
-	/* If we have been reset, we may not send again. */
+	// 检查套接字的状态是否为 TCP_CLOSE。如果是，表示连接已经关闭，不能再发送任何数据或 ACK，因此直接返回。
 	if (sk->sk_state == TCP_CLOSE)
 		return;
 
-	/* We are not putting this on the write queue, so
-	 * tcp_transmit_skb() will set the ownership to this
-	 * sock.
-	 */
+	// lloc_skb：分配一个新的 sk_buff（socket buffer），它用于承载网络数据包。这里使用 MAX_TCP_HEADER 来确定分配的空间大小，这个值表示 TCP 头的最大大小。
+	// sk_gfp_mask(sk, GFP_ATOMIC | __GFP_NOWARN)：用于指定分配内存的标志，GFP_ATOMIC 表示以原子方式分配内存，__GFP_NOWARN 防止在内存分配失败时输出警告。
 	buff = alloc_skb(MAX_TCP_HEADER,
 			 sk_gfp_mask(sk, GFP_ATOMIC | __GFP_NOWARN));
+	// 如果分配 skb 失败（buff 为 NULL），则需要进行一些回退操作。
+	// inet_csk_schedule_ack(sk)：调度一个延迟 ACK。
+	// inet_csk(sk)->icsk_ack.ato = TCP_ATO_MIN：设置 ACK 的超时为最小值。
+	// inet_csk_reset_xmit_timer：重置重传计时器，并设定超时时间，ICSK_TIME_DACK 表示延迟 ACK 的定时器。
 	if (unlikely(!buff)) {
 		inet_csk_schedule_ack(sk);
 		inet_csk(sk)->icsk_ack.ato = TCP_ATO_MIN;
@@ -3985,19 +3990,22 @@ void __tcp_send_ack(struct sock *sk, u32 rcv_nxt)
 		return;
 	}
 
-	/* Reserve space for headers and prepare control bits. */
+	// kb_reserve(buff, MAX_TCP_HEADER)：为数据包保留空间以存放 TCP 头部。
 	skb_reserve(buff, MAX_TCP_HEADER);
+	// tcp_init_nondata_skb：初始化 skb，并设置适当的 TCP 序列号和控制标志（此处为 TCPHDR_ACK，即 ACK 标志）。
+	// 使用tcp_acceptable_seq(sk) 获取当前可接受的序列号。
 	tcp_init_nondata_skb(buff, tcp_acceptable_seq(sk), TCPHDR_ACK);
 
-	/* We do not want pure acks influencing TCP Small Queues or fq/pacing
-	 * too much.
-	 * SKB_TRUESIZE(max(1 .. 66, MAX_TCP_HEADER)) is unfortunately ~784
-	 */
+	// 设置 skb 为纯 ACK 包。纯 ACK 包是指不携带数据的 ACK 包，它用于确认接收到的数据，而不携带任何有效负载。
+	// 以是避免纯 ACK 包对 TCP 小队列或流量控制（fq/pacing）产生过多影响
 	skb_set_tcp_pure_ack(buff);
 
-	/* Send it off, this clears delayed acks for us. */
+	// 将构建好的 skb 发送出去。rcv_nxt 是接收方期望接收的下一个序列号，用于更新接收窗口。
+	// 这个函数会处理数据包的传输，并根据需要更新延迟 ACK 的相关状态
+	// 该函数已经在前面讲解过
 	__tcp_transmit_skb(sk, buff, 0, (__force gfp_t)0, rcv_nxt);
 }
+// 将 __tcp_send_ack 函数导出，使其可以被其他模块访问
 EXPORT_SYMBOL_GPL(__tcp_send_ack);
 
 void tcp_send_ack(struct sock *sk)
