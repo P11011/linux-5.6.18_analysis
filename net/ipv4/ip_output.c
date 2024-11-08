@@ -137,22 +137,36 @@ static inline int ip_select_ttl(struct inet_sock *inet, struct dst_entry *dst)
 	return ttl;
 }
 
-/*
- *		Add an ip header to a skbuff and send it out.
- *
- */
+// 将一个 IP 头添加到一个 sk_buff（套接字缓冲区）并将其发送出去的
+// 参数介绍：
+// skb：要发送的数据包，包含了应用层数据和链路层数据等。此时需要添加 IP 头信息。
+// sk：发送数据包的套接字，包含了 TCP/UDP 连接信息以及与 IP 层相关的各种设置。
+// saddr：源 IP 地址。
+// daddr：目标 IP 地址。
+// opt：指向 ip_options_rcu 结构的指针，表示是否有 IP 选项（例如源路由选项
 int ip_build_and_send_pkt(struct sk_buff *skb, const struct sock *sk,
 			  __be32 saddr, __be32 daddr, struct ip_options_rcu *opt)
-{
+{	// inet：从套接字 sk 中获取 inet_sock 结构体，inet_sock 代表与 IPv4 协议相关的套接字。
+	// rt：通过 skb_rtable(skb) 获取与 skb 相关的路由表（rtable 结构体），它包含了目标 IP 地址的路由信息。
+	//net：从套接字 sk 获取 net（网络命名空间），它表示当前网络环境。
+	// iph：指向将要构建的 IP 头部（iphdr 结构体）
 	struct inet_sock *inet = inet_sk(sk);
 	struct rtable *rt = skb_rtable(skb);
 	struct net *net = sock_net(sk);
 	struct iphdr *iph;
 
-	/* Build the IP header. */
+	// 构建头部
+	// skb_push：将 skb 数据包缓冲区的起始位置向前推，腾出足够空间来存放 IP 头。
+	// sizeof(struct iphdr)：为标准的 IP 头部预留空间，iphdr 结构体大小通常为 20 字节（不包括选项）。
+	// (opt ? opt->opt.optlen : 0)：如果有 IP 选项，额外为 IP 选项的长度预留空间。如果没有选项，则不需要额外空间。
 	skb_push(skb, sizeof(struct iphdr) + (opt ? opt->opt.optlen : 0));
+	// 调用 skb_reset_network_header 来重置 skb 的网络层头部位置。这是因为 skb_push 操作会改变 skb 数据缓冲区的结构，需要重新定义网络层头部的位置。
 	skb_reset_network_header(skb);
+
+	// 获取 IP 头部的指针并初始化
+	// 通过 ip_hdr 获取 skb 中的 IP 头部结构体（iphdr）
 	iph = ip_hdr(skb);
+	// 设置相关参数
 	iph->version  = 4;
 	iph->ihl      = 5;
 	iph->tos      = inet->tos;
@@ -160,24 +174,45 @@ int ip_build_and_send_pkt(struct sk_buff *skb, const struct sock *sk,
 	iph->daddr    = (opt && opt->opt.srr ? opt->opt.faddr : daddr);
 	iph->saddr    = saddr;
 	iph->protocol = sk->sk_protocol;
+
+	// ip_dont_fragment(sk, &rt->dst)：检查是否需要禁用分片（根据套接字选项和目标路由的设置）。
+否则，若允许分片：
+iph->frag_off = 0;：分片偏移设为 0。
+__ip_select_ident(net, iph, 1);：为该数据包选择一个唯一的 IP 标识符
 	if (ip_dont_fragment(sk, &rt->dst)) {
+		// 如果设置了禁用分片：
+		// 设置分片偏移字段为 IP_DF，表示不允许分片。
 		iph->frag_off = htons(IP_DF);
+		// 将IP标识符设为 0
+		// 禁用分片时该字段没什么用，直接设置个默认值0（因为数据包不再被分片，接收端也不需要依据标识符来重组分片）
 		iph->id = 0;
 	} else {
+		// 若允许分
+		// 分片偏移设为 0。
 		iph->frag_off = 0;
+		// 为该数据包选择一个唯一的 IP 标识
 		__ip_select_ident(net, iph, 1);
 	}
 
+	// 检查是否存在 IP 选项，
 	if (opt && opt->opt.optlen) {
+		// 如果有的话。增加 IP 头部的长度（ihl），opt->opt.optlen 是 IP 选项的长度（单位为字节），
+		// oopt.optlen>>单位是8字节 iph->ihl单位是32字节 ，需要转换，所以除以4
+		// >>2 等于除以4需要除以 4 得到 32 位单元
 		iph->ihl += opt->opt.optlen>>2;
+		// 构建并添加 IP 选项到数据包中。ip_options_build 会根据提供的选项结构构建选项字段。
 		ip_options_build(skb, &opt->opt, daddr, rt, 0);
 	}
 
+	// 设置数据包的优先级。sk->sk_priority 表示该套接字的优先级，用于流量管理。
 	skb->priority = sk->sk_priority;
+	// 如果 skb 中的标记（mark）为空，则将其设置为套接字的标记（sk->sk_mark）
+	// mark 通常用于网络流量标识和过滤
 	if (!skb->mark)
 		skb->mark = sk->sk_mark;
 
-	/* Send it out. */
+	// 将构建好的数据包发送到本地网络接口。该函数会执行实际的网络传输操作，skb 会通过网络栈发送出去。
+	// 对应更底层操作
 	return ip_local_out(net, skb->sk, skb);
 }
 EXPORT_SYMBOL_GPL(ip_build_and_send_pkt);
